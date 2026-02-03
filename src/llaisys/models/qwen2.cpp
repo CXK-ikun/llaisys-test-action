@@ -1,0 +1,228 @@
+#include "../../../include/llaisys/models/qwen2.h"
+#include "../../tensor/tensor.hpp"
+#include "../../ops.hpp"
+#include "../llaisys_tensor.hpp" 
+#include <vector>
+#include <cstring>
+#include <cmath>
+#include <iostream>
+
+using namespace llaisys;
+
+struct LlaisysQwen2Model {
+    LlaisysQwen2Meta meta;
+    LlaisysQwen2Weights weights;
+    
+    std::vector<LlaisysTensor*> wrapper_keeper;
+
+    // KV Cache
+    std::vector<tensor_t> k_cache;
+    std::vector<tensor_t> v_cache;
+
+    // Buffers
+    LlaisysTensor* x_buf_wrapper;
+    LlaisysTensor* residual_wrapper;
+    LlaisysTensor* logits_buf_wrapper;
+    
+    LlaisysTensor* pos_id_wrapper;
+    LlaisysTensor* input_id_wrapper;
+
+    int64_t current_pos;
+
+    LlaisysQwen2Model() : current_pos(0) {}
+
+    ~LlaisysQwen2Model() {
+        for (auto p : wrapper_keeper) delete p;
+        if (weights.attn_norm_w) delete[] weights.attn_norm_w;
+        if (weights.attn_q_w) delete[] weights.attn_q_w;
+        if (weights.attn_q_b) delete[] weights.attn_q_b;
+        if (weights.attn_k_w) delete[] weights.attn_k_w;
+        if (weights.attn_k_b) delete[] weights.attn_k_b;
+        if (weights.attn_v_w) delete[] weights.attn_v_w;
+        if (weights.attn_v_b) delete[] weights.attn_v_b;
+        if (weights.attn_o_w) delete[] weights.attn_o_w;
+        if (weights.mlp_norm_w) delete[] weights.mlp_norm_w;
+        if (weights.mlp_gate_w) delete[] weights.mlp_gate_w;
+        if (weights.mlp_up_w) delete[] weights.mlp_up_w;
+        if (weights.mlp_down_w) delete[] weights.mlp_down_w;
+    }
+};
+
+extern "C" {
+
+inline tensor_t unwrap(llaisysTensor_t ptr) {
+    if (!ptr) return nullptr;
+    return ((LlaisysTensor*)ptr)->tensor;
+}
+
+// 修正：增加 dtype 参数，允许创建不同类型的 Tensor
+llaisysTensor_t create_wrapped(LlaisysQwen2Model* model, const std::vector<size_t>& shape, llaisysDataType_t dtype, llaisysDeviceType_t dev, int dev_id) {
+    auto t = Tensor::create(shape, dtype, dev, dev_id);
+    
+    LlaisysTensor* wrapper = new LlaisysTensor();
+    wrapper->tensor = t;
+    
+    model->wrapper_keeper.push_back(wrapper);
+    return (llaisysTensor_t)wrapper;
+}
+
+LlaisysQwen2Model* llaisysQwen2ModelCreate(const LlaisysQwen2Meta* meta, llaisysDeviceType_t dev, int* device_ids, int ndevice) {
+    auto model = new LlaisysQwen2Model();
+    model->meta = *meta;
+    int dev_id = (ndevice > 0) ? device_ids[0] : 0;
+
+    // 默认使用模型精度 (Float32)
+    auto cw = [&](std::vector<size_t> shape) -> llaisysTensor_t {
+        return create_wrapped(model, shape, (llaisysDataType_t)meta->dtype, dev, dev_id);
+    };
+
+    size_t nl = meta->nlayer;
+    model->weights.attn_norm_w = new llaisysTensor_t[nl];
+    model->weights.attn_q_w = new llaisysTensor_t[nl];
+    model->weights.attn_q_b = new llaisysTensor_t[nl];
+    model->weights.attn_k_w = new llaisysTensor_t[nl];
+    model->weights.attn_k_b = new llaisysTensor_t[nl];
+    model->weights.attn_v_w = new llaisysTensor_t[nl];
+    model->weights.attn_v_b = new llaisysTensor_t[nl];
+    model->weights.attn_o_w = new llaisysTensor_t[nl];
+    model->weights.mlp_norm_w = new llaisysTensor_t[nl];
+    model->weights.mlp_gate_w = new llaisysTensor_t[nl];
+    model->weights.mlp_up_w = new llaisysTensor_t[nl];
+    model->weights.mlp_down_w = new llaisysTensor_t[nl];
+
+    model->weights.in_embed = cw({meta->voc, meta->hs});
+    model->weights.out_embed = cw({meta->voc, meta->hs});
+    model->weights.out_norm_w = cw({meta->hs});
+
+    for(size_t i=0; i<nl; i++) {
+        model->weights.attn_norm_w[i] = cw({meta->hs});
+        model->weights.attn_q_w[i] = cw({meta->nh * meta->dh, meta->hs});
+        model->weights.attn_q_b[i] = cw({meta->nh * meta->dh});
+        model->weights.attn_k_w[i] = cw({meta->nkvh * meta->dh, meta->hs});
+        model->weights.attn_k_b[i] = cw({meta->nkvh * meta->dh});
+        model->weights.attn_v_w[i] = cw({meta->nkvh * meta->dh, meta->hs});
+        model->weights.attn_v_b[i] = cw({meta->nkvh * meta->dh});
+        model->weights.attn_o_w[i] = cw({meta->hs, meta->nh * meta->dh});
+
+        model->weights.mlp_norm_w[i] = cw({meta->hs});
+        model->weights.mlp_gate_w[i] = cw({meta->di, meta->hs});
+        model->weights.mlp_up_w[i] = cw({meta->di, meta->hs});
+        model->weights.mlp_down_w[i] = cw({meta->hs, meta->di});
+
+        model->k_cache.push_back(Tensor::create({meta->maxseq, meta->nkvh, meta->dh}, (llaisysDataType_t)meta->dtype, dev, dev_id));
+        model->v_cache.push_back(Tensor::create({meta->maxseq, meta->nkvh, meta->dh}, (llaisysDataType_t)meta->dtype, dev, dev_id));
+    }
+    
+    // 运行时 Buffer (F32)
+    model->x_buf_wrapper = (LlaisysTensor*)create_wrapped(model, {1, meta->hs}, (llaisysDataType_t)meta->dtype, dev, dev_id);
+    model->residual_wrapper = (LlaisysTensor*)create_wrapped(model, {1, meta->hs}, (llaisysDataType_t)meta->dtype, dev, dev_id);
+    model->logits_buf_wrapper = (LlaisysTensor*)create_wrapped(model, {1, meta->voc}, (llaisysDataType_t)meta->dtype, dev, dev_id);
+    
+    // 修正：pos_id 和 input_id 必须是 INT64 (Type 6)，否则写入 8 字节数据时会溢出 F32 的 4 字节 buffer
+    model->pos_id_wrapper = (LlaisysTensor*)create_wrapped(model, {1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+    model->input_id_wrapper = (LlaisysTensor*)create_wrapped(model, {1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+
+    return model;
+}
+
+void llaisysQwen2ModelDestroy(LlaisysQwen2Model* model) {
+    if (model) delete model;
+}
+
+LlaisysQwen2Weights* llaisysQwen2ModelWeights(LlaisysQwen2Model* model) {
+    return &model->weights;
+}
+
+int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model* model, int64_t* token_ids, size_t ntoken) {
+    //std::cerr << "[C++] Entering llaisysQwen2ModelInfer, current_pos=" << model->current_pos << " ntoken=" << ntoken << "\n";
+    auto& m = model->meta;
+    auto dev = model->x_buf_wrapper->tensor->deviceType();
+    
+    int64_t current_token_id = token_ids[model->current_pos];
+    
+    *(int64_t*)model->input_id_wrapper->tensor->data() = current_token_id;
+    // Inline embedding: copy row `current_token_id` from in_embed to x_buf
+    //std::cerr << "[C++] qwen2: before inline embedding copy, token=" << current_token_id << "\n";
+    {
+        auto in_embed = unwrap(model->weights.in_embed);
+        size_t hidden = m.hs;
+        size_t elem_size = in_embed->elementSize();
+        size_t row_bytes = hidden * elem_size;
+
+        const std::byte* src = in_embed->data() + (size_t)current_token_id * row_bytes;
+        std::byte* dst = model->x_buf_wrapper->tensor->data();
+        std::memcpy(dst, src, row_bytes);
+    }
+    //std::cerr << "[C++] qwen2: after inline embedding copy\n";
+
+    // 2. Transformer Layers
+    for(size_t i=0; i<m.nlayer; i++) {
+        
+        // 进度打印
+        printf("[C++ Layer] Processing Layer %zu / %zu ...\r", i+1, m.nlayer);
+        fflush(stdout); 
+
+        ops::rearrange(model->residual_wrapper->tensor, model->x_buf_wrapper->tensor);
+
+        ops::rms_norm(model->x_buf_wrapper->tensor, model->x_buf_wrapper->tensor, unwrap(model->weights.attn_norm_w[i]), m.epsilon);
+
+        auto q = Tensor::create({1, m.nh * m.dh}, (llaisysDataType_t)m.dtype, dev, 0);
+        auto k = Tensor::create({1, m.nkvh * m.dh}, (llaisysDataType_t)m.dtype, dev, 0);
+        auto v = Tensor::create({1, m.nkvh * m.dh}, (llaisysDataType_t)m.dtype, dev, 0);
+
+        ops::linear(q, model->x_buf_wrapper->tensor, unwrap(model->weights.attn_q_w[i]), unwrap(model->weights.attn_q_b[i]));
+        ops::linear(k, model->x_buf_wrapper->tensor, unwrap(model->weights.attn_k_w[i]), unwrap(model->weights.attn_k_b[i]));
+        ops::linear(v, model->x_buf_wrapper->tensor, unwrap(model->weights.attn_v_w[i]), unwrap(model->weights.attn_v_b[i]));
+
+        auto q_view = q->view({1, m.nh, m.dh});
+        auto k_view = k->view({1, m.nkvh, m.dh});
+        auto v_view = v->view({1, m.nkvh, m.dh});
+
+        *(int64_t*)model->pos_id_wrapper->tensor->data() = model->current_pos;
+        ops::rope(q_view, q_view, model->pos_id_wrapper->tensor, m.theta);
+        ops::rope(k_view, k_view, model->pos_id_wrapper->tensor, m.theta);
+
+        auto k_slot = model->k_cache[i]->slice(0, model->current_pos, model->current_pos + 1);
+        auto v_slot = model->v_cache[i]->slice(0, model->current_pos, model->current_pos + 1);
+        ops::rearrange(k_slot, k_view);
+        ops::rearrange(v_slot, v_view);
+
+        auto k_history = model->k_cache[i]->slice(0, 0, model->current_pos + 1);
+        auto v_history = model->v_cache[i]->slice(0, 0, model->current_pos + 1);
+
+        auto attn_out = Tensor::create({1, m.nh * m.dh}, (llaisysDataType_t)m.dtype, dev, 0);
+        ops::self_attention(attn_out->view({1, m.nh, m.dh}), q_view, k_history, v_history, 1.0f / sqrt(m.dh));
+
+        ops::linear(model->x_buf_wrapper->tensor, attn_out, unwrap(model->weights.attn_o_w[i]), nullptr);
+
+        ops::add(model->x_buf_wrapper->tensor, model->x_buf_wrapper->tensor, model->residual_wrapper->tensor);
+
+        ops::rearrange(model->residual_wrapper->tensor, model->x_buf_wrapper->tensor);
+
+        ops::rms_norm(model->x_buf_wrapper->tensor, model->x_buf_wrapper->tensor, unwrap(model->weights.mlp_norm_w[i]), m.epsilon);
+
+        auto gate = Tensor::create({1, m.di}, (llaisysDataType_t)m.dtype, dev, 0);
+        auto up = Tensor::create({1, m.di}, (llaisysDataType_t)m.dtype, dev, 0);
+        
+        ops::linear(gate, model->x_buf_wrapper->tensor, unwrap(model->weights.mlp_gate_w[i]), nullptr);
+        ops::linear(up, model->x_buf_wrapper->tensor, unwrap(model->weights.mlp_up_w[i]), nullptr);
+        
+        ops::swiglu(gate, gate, up);
+
+        ops::linear(model->x_buf_wrapper->tensor, gate, unwrap(model->weights.mlp_down_w[i]), nullptr);
+
+        ops::add(model->x_buf_wrapper->tensor, model->x_buf_wrapper->tensor, model->residual_wrapper->tensor);
+    }
+
+    ops::rms_norm(model->x_buf_wrapper->tensor, model->x_buf_wrapper->tensor, unwrap(model->weights.out_norm_w), m.epsilon);
+    ops::linear(model->logits_buf_wrapper->tensor, model->x_buf_wrapper->tensor, unwrap(model->weights.out_embed), nullptr);
+
+    auto max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
+    auto max_val = Tensor::create({1}, (llaisysDataType_t)m.dtype, LLAISYS_DEVICE_CPU, 0);
+    ops::argmax(max_idx, max_val, model->logits_buf_wrapper->tensor);
+
+    model->current_pos++;
+    return *reinterpret_cast<int64_t*>(max_idx->data());
+}
+
+} // extern "C"
